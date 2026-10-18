@@ -195,6 +195,13 @@ pnpm deploy:splits
 pnpm run node:local     # docker compose up -d (Stellar Quickstart)
 ```
 
+### End-to-end walkthrough
+
+Want the complete path — local node → deploy `stream` → fund accounts → create a stream →
+advance time → withdraw — with every command and its expected output? Follow the
+[end-to-end walkthrough](docs/development-guide.md#3-end-to-end-walkthrough-a-stream-from-zero-to-withdraw)
+in the development guide (verified on Linux).
+
 ---
 
 ## SDK usage
@@ -306,6 +313,13 @@ Security reports go through [SECURITY.md](SECURITY.md), not public issues.
 ## Deployments
 
 Testnet contract ids and explorer links are recorded in [docs/deployments.md](docs/deployments.md).
+
+## Troubleshooting
+
+Seeing `Freighter wallet extension is not installed or enabled.`, `No stream contract id
+configured.`, `Account not found`, or `RPC kept answering TRY_AGAIN_LATER ...`? Each known
+symptom with its cause and fix is listed in [docs/troubleshooting.md](docs/troubleshooting.md),
+along with how to confirm the deployment state via the contract ids page.
 
 ## Contributing
 
