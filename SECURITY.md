@@ -20,86 +20,90 @@ We take the security of our project seriously. If you find a security vulnerabil
 
 Thank you for helping keep this project secure!
 
----
+## Threat Model
 
-## Security model
+The contracts have not been audited. This section records what has been analysed and tested so
+far, and the assumptions the contracts rely on.
 
-This section documents the protocol's **trust assumptions**: what each actor can and cannot do,
-and which risks are inherent to the current design. It is written against the Rust contract source
-(`contracts/*/src/lib.rs`), which is the reference implementation. Entry points, error codes, and
-event shapes are enumerated in [docs/contracts.md](docs/contracts.md).
+### Reentrancy through token callbacks
 
-### Actor powers, per contract
+**Threat.** Every contract moves funds through a SEP-41 token contract that it does not control:
+the stream's `token`, the escrow's `token`, and the `token` passed to each splits `distribute`
+call. A hostile token can run arbitrary code inside `transfer`, including a call back into the
+contract that invoked it, while that contract is part-way through `withdraw`, `cancel`,
+`release_escrow`, `refund_escrow`, `cancel_escrow`, `fund_escrow` or `distribute`. If that
+callback could observe state from before the payout, it could withdraw the same vested balance
+twice, or both release an escrow to the payee and refund it to the payer.
 
-#### `stream`
+**Finding 1: the Soroban host rejects reentry.** Every cross-contract call, whether made with
+`invoke_contract` or `try_invoke_contract`, runs with reentry prohibited. When a call targets a
+contract that is already anywhere on the call stack, the host refuses it with
+`Error(Context, InvalidAction)` ("Contract re-entry is not allowed") before any of that
+contract's code runs. This covers indirect cycles too (stream → token → other contract →
+stream). A reentrant call therefore never reaches the contract's checks at all, and so can't
+spend anything.
 
-| Actor         | Powers                                                                                                                                                                                                               | Cannot                                                                                                                                                                                                       |
-| :------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Sender**    | Creates a stream (which pulls the **full** amount into the contract up front, requiring the sender's signature and a token allowance); cancels it at any time, which refunds the **unvested** remainder immediately. | Cannot touch funds once vested; cannot change the recipient; cannot cancel twice.                                                                                                                            |
-| **Recipient** | Withdraws the vested-but-unclaimed balance at any time (protocol fee deducted at withdrawal). The recipient address is fixed at creation.                                                                            | Cannot be changed or impersonated — `withdraw` requires the recipient's signature; cannot withdraw pre-cliff funds.                                                                                          |
-| **Admin**     | Set once via `initialize` (callable exactly once). Afterwards: `set_fee` (capped at 1000 bps = 10%) and `set_treasury`.                                                                                              | **Cannot touch locked funds.** No upgrade, no pause, no withdrawal entry point, no ability to change a stream's sender/recipient/token. The admin's entire leverage is the fee rate on _future_ withdrawals. |
-| **Treasury**  | Receives the protocol fee on each withdrawal.                                                                                                                                                                        | Cannot initiate anything; it is a passive destination address. Note: before the first `initialize`, a `withdraw` against a fee-bearing stream fails with `TreasuryNotSet`.                                   |
-| **Anyone**    | Reads `get_stream`, `claimable`, `vested`, `get_config`, `next_stream_id`.                                                                                                                                           | Cannot mutate state.                                                                                                                                                                                         |
+**Finding 2: state is now written before outbound transfers.** Before this analysis, `withdraw`,
+`cancel`, `release_escrow`, `refund_escrow` and `cancel_escrow` transferred tokens first and
+recorded the new state afterwards. That was not exploitable given Finding 1, but it meant safety
+rested on the host alone. These paths now follow checks-effects-interactions: `withdrawn`, the
+cancelled schedule, or the escrow's final status is persisted before the token is called. If the
+host guarantee were ever weakened, a callback would see the stream already debited or the escrow
+already closed, and would fail the contracts' own `NothingToWithdraw`, `AlreadyCancelled` and
+`AlreadyFinalized` checks.
 
-Cancellation is **cancel-safe by construction**: the sender is refunded only the unvested portion
-(`total − vested` at the cancel timestamp) and the schedule is compressed so the recipient's
-already-vested balance remains withdrawable.
+Inbound pulls (`create_stream`, `fund_escrow`, and the first leg of `distribute`) still move
+the funds before recording the claim they back, so that a stream or a funded escrow is never on
+the ledger without its tokens.
 
-#### `splits`
+**Finding 3: writing early is safe because invocations are atomic.** When a transfer fails,
+including a token that panics because its callback was rejected, the whole invocation is rolled
+back, including the state written before the transfer. A transfer that fails after the early
+write cannot leave a stream marked as withdrawn or an escrow marked as finalized.
 
-| Actor              | Powers                                                                                                                                     | Cannot                                                                               |
-| :----------------- | :----------------------------------------------------------------------------------------------------------------------------------------- | :----------------------------------------------------------------------------------- |
-| **Creator**        | Registers an immutable split (non-empty recipients, matching non-zero shares, no duplicates).                                              | Cannot modify or delete a split after creation; cannot claw back funds paid into it. |
-| **Payer** ("from") | Any address that signs `distribute` pays in the amount and triggers the distribution.                                                      | Cannot choose different shares — the split's configuration is fixed on-chain.        |
-| **Recipients**     | Receive `amount × share / total_shares` per distribution (integer math; rounding dust goes to the final recipient so nothing is stranded). | Cannot pull funds; recipients must wait for someone to call `distribute`.            |
-| **Admin**          | None. The splits contract has **no admin, no fee, and no owner**.                                                                          | —                                                                                    |
+**No explicit reentrancy guard.** A storage-flag guard would duplicate what the host already
+enforces, cost an extra ledger write on every call, and be rolled back by the same atomicity
+it would rely on. We chose checks-effects-interactions ordering as the defence-in-depth layer
+instead.
 
-#### `escrow`
+**Tests.** A shared `HostileTokenContract` test fixture implements `transfer` and, when armed,
+makes a single call back into a chosen contract function before any balance moves. Each test
+allows non-root auth, so `require_auth` would let the reentrant call through and the host's
+reentry check is the only thing that can stop it. Each test asserts that the callback was
+attempted and refused with the reentry error, that funds moved exactly once, and that stored
+state is consistent afterwards.
 
-| Actor       | Powers                                                                                                                                                                                    | Cannot                                                                                                    |
-| :---------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------- |
-| **Payer**   | Creates the agreement (payer-signed) and funds it (payer-signed transfer into the contract). May cancel while unfunded at any time, and after the deadline once funded. May also release. | Cannot refund unilaterally before the deadline.                                                           |
-| **Payee**   | May refund the escrow back to the payer once funded.                                                                                                                                      | **Cannot self-release** — release requires the payer or the arbiter.                                      |
-| **Arbiter** | Full discretionary power once funded: may `release_escrow` (payee is paid) **or** `refund_escrow` (payer is paid), at any time, before or after the deadline.                             | Cannot cancel, cannot move funds to a third party, cannot act on an unfunded or already-finalized escrow. |
-| **Anyone**  | Reads `get_escrow`.                                                                                                                                                                       | Cannot mutate state.                                                                                      |
+| Contract | Outer call       | Reentrant call   |
+| :------- | :--------------- | :--------------- |
+| stream   | `withdraw`       | `withdraw`       |
+| stream   | `withdraw`       | `cancel`         |
+| stream   | `withdraw` (fee) | `withdraw`       |
+| stream   | `cancel`         | `withdraw`       |
+| stream   | `cancel`         | `cancel`         |
+| escrow   | `fund_escrow`    | `fund_escrow`    |
+| escrow   | `release_escrow` | `refund_escrow`  |
+| escrow   | `release_escrow` | `release_escrow` |
+| escrow   | `refund_escrow`  | `release_escrow` |
+| escrow   | `cancel_escrow`  | `release_escrow` |
+| splits   | `distribute`     | `distribute`     |
 
-Key escrow consequence for integrators: **the arbiter is a trusted third party in the full sense**
-of the word — a single arbiter signature can irrevocably move the escrowed funds to either side.
-Choose arbiters accordingly, and note there is no appeal path on-chain.
+In these tests the token swallows the rejection and lets the outer call finish, which is the
+stronger attack. Separate tests have the token let the rejection propagate instead, and confirm
+that `withdraw`, `release_escrow` and `distribute` then roll back completely. A control test
+aims the same callback at a second stream contract that is not on the call stack and confirms it
+succeeds, which shows the refusals come from the reentry check and not from the fixture.
 
-### Inherent risks (read before integrating)
+### Token trust assumptions
 
-- **No upgradeability.** The contracts are deliberately non-upgradeable: there is no proxy, no
-  migration entry point, and no admin escape hatch. A bug in deployed bytecode cannot be patched in
-  place — mitigating one requires deploying a new contract and persuading users to migrate funds
-  (for `stream`, by cancelling and re-creating). This cuts both ways: no admin can rug-patch the
-  rules either.
-- **Unaudited contracts.** No third-party security audit has been performed. The contracts are
-  unit-tested (29 tests) and lint-clean, but that is not a substitute for review. Treat the
-  pre-1.0 contracts as un-audited software and do not secure material Mainnet value with them.
-- **Admin key custody (`stream` only).** The stream admin can raise the protocol fee up to 10% and
-  redirect the treasury address. A compromised admin can therefore increase the cost of _future_
-  withdrawals and redirect fees, but **cannot** steal already-locked principal or bypass
-  sender/recipient signatures. Rotate custody to a multisig before any Mainnet deployment, and
-  note that `initialize` is one-shot — the admin is permanent for the life of the instance.
-- **TTL expiry.** Stream, split, and escrow records live in Soroban persistent storage and expire
-  unless their TTL is extended. Every write bumps the entry (~1 day threshold, ~30 days maximum
-  per bump), but **no one can call a write for you**: if a stream or escrow is left dormant for
-  longer than its remaining TTL (roughly a month at worst), its ledger entry expires and the funds
-  held in the contract become unrecoverable — there is no rebuild-from-events entry point. Monitor
-  long-lived streams and bump them (any state-mutating call on the record extends it).
-- **Lost wallet keys.** There is no key recovery, no admin recovery, and no governance override. If
-  the **recipient** loses their key, all unwithdrawn vested funds are permanently locked; if the
-  **sender** loses their key before cancelling, the unvested remainder can never be refunded. The
-  same applies to escrow payers, payees, and arbiters.
-- **Token assumptions.** Contracts hold balances of arbitrary SEP-41 tokens. A malicious or
-  non-standard token (rebasing, fee-on-transfer, blacklisting) can break the arithmetic or
-  invariants the contracts assume; only use tokens whose transfer semantics you trust.
+Reentrancy is the only token behaviour these defences cover. The contracts otherwise trust the
+token to honour SEP-41:
 
-### Audit status
-
-The protocol is **pre-1.0 and unaudited**. A third-party audit and a 1.0 contract freeze are on the
-[roadmap](ROADMAP.md) ("Later" milestone) but are not scheduled commitments. The README's project
-status callout carries the same warning.
-
-Integrators should re-read this file and [ROADMAP.md](ROADMAP.md) before Mainnet use.
+- **A token can lie.** A `transfer` that moves nothing, or a `balance` that misreports, will
+  break accounting for any position denominated in that token.
+- **Fee-on-transfer or rebasing tokens are unsupported.** Accounting assumes `transfer` moves
+  exactly `amount`, so `withdrawn` and escrow amounts will drift from real balances.
+- **The damage stays within one token.** A contract's balance in a token lives in that token's
+  own ledger, so a hostile token can only affect streams, escrows or distributions that are
+  denominated in it. Senders choose the token, and integrators should check that it is the
+  expected contract (for example, the Stellar Asset Contract for a classic asset) before
+  creating a stream or escrow.
